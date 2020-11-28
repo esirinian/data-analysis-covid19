@@ -1,0 +1,559 @@
+---
+title: "STAT 420: Final Project"
+author: "Ayesha Raza, Andrew Hoeft, Eric Sirinian"
+date: "August 7, 2020"
+output:
+  html_document:
+    theme: readable
+  pdf_document: default
+urlcolor: cyan
+---
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE}
+library(faraway)
+library(readr)
+library(lmtest)
+library(MASS)
+library(DMwR)
+library(knitr)
+```
+
+# **The Novel COVID-19 Response on a Global Scale**
+
+## *Introduction*
+
+This analysis will explore the relationships for both case and death counts with geography, population density, and socioeconomic status with normalizations for smoking prevalence, diabetes prevalence, and other environmental controls. Ultimately, we seek to expose meaningful hidden dynamics in the novel COVID-19 crisis and extend the general understanding of the extent to which vulnerable populations are shouldering a disproportionate share of the overall public health burden.
+
+Our goal, through this analysis, is to garner a better understanding of this infectious disease. Having never experienced something of this caliber in the last century, the pandemic has a vice-grip on the world; bringing it to an almost screeching halt. With the volumes of data already analyzed and still no solid grasp at how to effectively combat this without self-isolating for weeks at a time, we aim to uncover new insights on affected populations around the world. In particular, we are interested building models for COVID-19 death rates based on environmental conditions and population dynamics and using those models to back out which dataset dimensions are dominant predictors of hieghtened propensity for outbreak.
+
+The data we will use to perform these inferences are provided by *Our World in Data* (OWID). This aggregator collects publicly available information published by official sources on the COVID-19 pandemic and consolidates these data in a single archive.^[In some cases, for countries where the collection of data from the orignal source is "prohibitively difficult", OWID states they may collect data from non-official repositories.] Updated regularly, the data OWID provide covers most of the world with a majority of their data being no older than 1 week old. While there is no official verification of the data, OWID does state that they highlight ambiguities or problems. The data file describes the total number of cases and deaths for those who tested positive on COVID-19 by date and country. There are also expectancy and prevalency data on sensitive populations who are generally considered to be severely at-risk to complications and elevated mortality rates from COVID-19 (namely, smokers, diabetics, and the elderly).
+
+## *Methods*
+Our analysis begins by ingesting and cleansing the OWID dataset.
+
+```{r, message = FALSE, warning = FALSE}
+covid = read.csv("owid-covid-data.csv")
+```
+
+A number of columns provide useful information for time-series based analysis (e.g. assessing changes over time). However, in the context of our problem statement, these will not be especially useful since we want to frame our analysis around a specific snapshot in time to determine the impact of predictor variables on the response (death rate). If these time-series variables were instead included, each individual geographical or socio-economic predictor would have had a distribution of death rates over time based on when their local outbreak occurred. This would impart significant noise in every response for a given set of inputs and cause the predicted value to essentially be the time-weighted average of all prior values - which is effectively useless. For this reason, we also frame our analysis around a specific date. We chose July 9, 2020, as this is the latest value in the dataset for which most predictors are populated. This should enable us to minimize misrepresentation of the data.
+
+```{r, message = FALSE, warning = FALSE}
+columns_to_drop = c(
+  "iso_code", "continent", "tests_units", "total_cases", "new_cases", "new_deaths",
+  "total_tests", "new_cases_per_million", "total_cases_per_million",
+  "total_deaths_per_million", "new_deaths_per_million", "new_tests",
+  "total_tests_per_thousand", "new_tests_per_thousand", "aged_65_older",
+  "total_cases_by_population", "new_tests_smoothed_per_thousand", "new_tests_smoothed"
+)
+data = covid[, !names(covid) %in% columns_to_drop]
+data$date = as.character(data$date)
+data = data[!(data$location=="World"),]
+data = data[data$date == "7/9/2020", ]
+country_date = data
+data = data[, !names(data) %in% c("date", "location")]
+```
+
+As an final data preparation step, we used kNN imputation to fill in the null values. This is a quick and easy way to get probable metrics.
+
+```{r}
+data = DMwR::knnImputation(data)
+```
+
+Using all available predictors, we begin our analysis with a full linear model:
+
+```{r}
+td_mod = lm(total_deaths ~ ., data = data)
+summary(td_mod)
+vif(td_mod)
+```
+
+Immediately, we notice issues with collinearity for several predictors (those having VIF values greater than 5). Let's assess assumptions of homoscedasticity and normality.
+
+```{r fig.align="center"}
+par(mfrow=c(1, 2))
+
+# Fitted vs. Residual
+plot(
+  fitted(td_mod),
+  resid(td_mod),
+  col = 'grey',
+  pch=20,
+  xlab = "Fitted",
+  ylab = 'Residuals',
+  main = 'Fitted vs. Residual for td_mod'
+)
+abline(h = 0, col = 'darkorange', lwd = 2)
+
+# Q-Q Norm
+qqnorm(resid(td_mod), main = "Normal Q-Q Plot, td_mod", col = 'darkgrey')
+qqline(resid(td_mod), col = 'dodgerblue', lwd = 2)
+```
+
+Based on the Fitted vs. Residual and Normal Q-Q plots, the data appear to have non-constant variance about the true model and the errors do not appear to have been sampled from a normal distribution. These conclusions from visual inspection are supported by the Breuch-Pagan and Shapiro-Wilk tests.
+
+```{r}
+knitr::kable(data.frame(
+  "Test" = c("Breuch-Pagan", "Shapiro-Wilk"),
+  "P-Value" = c(
+    unname(bptest(td_mod)$p.value),
+    shapiro.test(resid(td_mod))$p.value)
+  )
+)
+```
+
+The $p$-value from the Breuch-Pagan test lies near a threshold value (alpha = 0.1) which would cause things to be highly suspect; in this case with the computed value, we can maintain the assumption of homoscedasticity (i.e. we fail to reject the null hypothesis that homoscedasticity is valid). However, the small $p$-value from the Shapiro-Wilk test decisively supports the conclusion that the data could have been sampled from a normal distribution.
+
+To attempt to improve this performance, we consider the leverage of each value and assess if any points are influential based on the standard thresholds used on prior analysis:
+
+```{r}
+# Do any countries have high leverage?
+(list(country_date[hatvalues(td_mod) > 2 * mean(hatvalues(td_mod)), ]$location)[[1]])
+# Are any countries outliers?
+(list(country_date[names(rstandard(td_mod)[abs(rstandard(td_mod)) > 2]), ]$location)[[1]])
+# Are any countries that are considered influential?
+(list(country_date[cooks.distance(td_mod) > 4 / length(cooks.distance(td_mod)), ]$location)[[1]])
+```
+
+We should consider removing these observations to see what the effect it has on model performance:
+```{r}
+cd_td_mod = cooks.distance(td_mod)
+td_mod_fix = lm(total_deaths ~ ., data = data, subset = cd_td_mod <= 4 / length(cd_td_mod))
+summary(td_mod_fix)
+vif(td_mod_fix)
+
+knitr::kable(data.frame(
+  "Test" = c("Breuch-Pagan", "Shapiro-Wilk"),
+  "P-Value" = c(
+    unname(bptest(td_mod_fix)$p.value),
+    shapiro.test(resid(td_mod_fix))$p.value)
+  )
+)
+```
+
+Even by removing these influential values, we find that there is not a meaningful impact on the model coefficients or the test results. In fact, the homoscedasticity assumption is deemed no longer valid based on the new Breuch-Pagan test $p$-value.
+
+Now, let us consider a very large model based on the interactions of several key socio-economic and geographic predictor dimensions.
+
+```{r}
+big_mod = lm(total_deaths ~ hospital_beds_per_thousand * gdp_per_capita * population_density * aged_70_older, data = data)
+summary(big_mod)
+```
+
+In this case, the multiple $R^2$ value and adjusted $R^2$ values are actually worse than the original model. By exploring the linear, independent, normally-distributed, and equal variance assumptions, we find that this model is not a significant improvement on the original model.
+
+```{r fig.align="center"}
+par(mfrow=c(1, 2))
+plot(fitted(big_mod), resid(big_mod), col = 'grey', pch=20,
+     xlab = "Fitted", ylab = 'Residuals', main = 'Data from big_mod')
+abline(h = 0, col = 'darkorange', lwd = 2)
+qqnorm(resid(big_mod), main = "Normal Q-Q Plot, big_mod", col = 'darkgrey')
+qqline(resid(big_mod), col = 'dodgerblue', lwd = 2)
+
+knitr::kable(data.frame(
+  "Test" = c("Breuch-Pagan", "Shapiro-Wilk"),
+  "P-Value" = c(
+    unname(bptest(big_mod)$p.value),
+    shapiro.test(resid(big_mod))$p.value)
+  )
+)
+```
+
+For further confirmation, we identify and remove the influential points. Unfortunately, the conclusion remains the same.
+
+```{r fig.align="center"}
+cd_big_mod = cooks.distance(big_mod)
+big_mod_fix = lm(
+  total_deaths ~ hospital_beds_per_thousand * gdp_per_capita * population_density * aged_70_older, 
+  data = data,
+  subset = cd_big_mod <= 4 / length(cd_big_mod)
+)
+
+par(mfrow=c(1, 2))
+plot(fitted(big_mod_fix), resid(big_mod_fix), col = 'grey', pch=20,
+     xlab = "Fitted", ylab = 'Residuals', main = 'Data from big_mod')
+abline(h = 0, col = 'darkorange', lwd = 2)
+qqnorm(resid(big_mod_fix), main = "Normal Q-Q Plot, big_mod", col = 'darkgrey')
+qqline(resid(big_mod_fix), col = 'dodgerblue', lwd = 2)
+
+knitr::kable(data.frame(
+  "Test" = c("Breuch-Pagan", "Shapiro-Wilk"),
+  "P-Value" = c(
+    unname(bptest(big_mod_fix)$p.value),
+    shapiro.test(resid(big_mod_fix))$p.value)
+  )
+)
+```
+
+Reverting back to the original additive model, we will attempt to apply a response transformation in the hopes of stabilizing the variance (assessed via the Normal Q-Q plot and the Shapiro-Wilk test). Since some response values are zero (which causes errors for log transformations), we add a very small value to all response values.
+```{r fig.align="center"}
+log_prepped_data = data
+log_prepped_data$total_deaths = log_prepped_data$total_deaths + 0.0001
+td_mod_log = lm(log(total_deaths) ~ ., data = log_prepped_data)
+summary(td_mod_log)
+
+par(mfrow=c(1, 2))
+plot(fitted(td_mod_log), resid(td_mod_log), col = 'grey', pch=20,
+     xlab = "Fitted", ylab = 'Residuals', main = 'Data from td_mod_log')
+abline(h = 0, col = 'darkorange', lwd = 2)
+qqnorm(resid(td_mod_log), main = "Normal Q-Q Plot, td_mod_log", col = 'darkgrey')
+qqline(resid(td_mod_log), col = 'dodgerblue', lwd = 2)
+```
+
+Now, we find the Fitted vs. Residual and Nornal Q-Q plots to look better. However, if we use RMSE as a metric of model quality improvement, we find find that the new model does not significantly improve over the baseline. By contrast, the adjusted $R^2$ values tell a different story (with the new value being mildly better than the baseline).
+
+```{r}
+# Simple comparison of models using RMSE as metric
+(sqrt(mean((data$total_deaths - fitted(td_mod)) ^ 2)))
+(sqrt(mean((log_prepped_data$total_deaths - exp(fitted(td_mod_log))) ^ 2)))
+
+```
+
+To assess stability, we add some noise to the baseline model and compare the original fitted values with new fitted values. Based on the plot below, we find that the baseline model seems robust to small perturbations.
+```{r fig.align="center"}
+# Adding some noise to see the effect
+set.seed(20200807)
+noise = rnorm(n=nrow(data), mean = 0, sd = 5)
+td_mod_noise = lm(total_deaths + noise ~ ., data = data)
+
+plot(fitted(td_mod), fitted(td_mod_noise), col = 'dodgerblue', pch = 20,
+     xlab = 'Predicted, Without Noise', ylab = 'Predicted, With Noise', cex = 1.5)
+abline(a = 0, b = 1, col = 'darkorange', lwd = 2)
+```
+
+Since a larger interaction model and a log-transfomed model did not show significant improvement over the baseline additive model, we will now consider a smaller model.
+
+```{r}
+# Looking at a smaller model 
+td_mod_small = lm(total_deaths ~ gdp_per_capita + male_smokers + stringency_index, data = data)
+summary(td_mod_small)
+vif(td_mod_small)
+```
+
+Using a very small number of predictors, we find that multicollinaerity is no longer a problem. However, the multiple and adjusted $R^2$ values are significantly worse than the baseline. If nothing else, this reduction in predictor dimensions has been too extreme. Looking at the Analysis of Variations between these two models, we clearly still prefer the baseline model (i.e. we reject the null hypothesis that the simpler model contains all the useful information of the larger baseline model).
+
+```{r}
+anova(td_mod_small, td_mod)
+```
+
+Rather than down-selecting predictor variables at random, let us attempt to infer better down-sampled models using a deliberate search strategy. We also compare adjusted $R^2$ values to identify which model performs best. We find the AIC model to have the best adjusted $R^2$. However, the BIC model has a slightly better LOOCV-RMSE value.
+
+```{r}
+td_mod_back_aic = step(td_mod, direction="backward", trace = 0)
+td_mod_back_bic = step(td_mod, direction="backward", k = log(length(resid(td_mod))), trace = 0)
+
+(orig_r2 = summary(td_mod)$adj.r.squared)
+(bck_aic_r2 = summary(td_mod_back_aic)$adj.r.squared)
+(bck_bic_r2 = summary(td_mod_back_bic)$adj.r.squared)
+
+calc_loocv_rmse = function(model) {
+  sqrt(mean((resid(model) / (1 - hatvalues(model))) ^ 2))
+}
+(orig_lr = calc_loocv_rmse(td_mod))
+(bck_aic_lr = calc_loocv_rmse(td_mod_back_aic))
+(bck_bic_lr = calc_loocv_rmse(td_mod_back_bic))
+# But looks like BIC slightly edges out AIC in LOOCV RMSE...interesting
+```
+
+Through a similar process, we forward-search for AIC and BIC models. A comparison of model performances (RMSE and LOOCV-RMSE) indicate that these models perform equivalently to the backward models - and are equivalently rejected.
+
+```{r}
+# Trying forward search
+td_mod_start = lm(total_deaths ~ 1, data = data)
+td_mod_forw_aic = step(
+  td_mod_start,
+  scope = total_deaths ~ stringency_index + population + 
+    population_density + median_age + aged_70_older + gdp_per_capita +
+    extreme_poverty + cvd_death_rate + diabetes_prevalence + female_smokers +
+    male_smokers + handwashing_facilities + hospital_beds_per_thousand + life_expectancy,
+  direction = "forward", trace = 0)
+
+td_mod_forw_bic = step(
+  td_mod_start,
+  scope = total_deaths ~ stringency_index + population + 
+    population_density + median_age + aged_70_older + gdp_per_capita +
+    extreme_poverty + cvd_death_rate + diabetes_prevalence + female_smokers +
+    male_smokers + handwashing_facilities + hospital_beds_per_thousand + life_expectancy,
+  direction = "forward", k = log(length(resid(td_mod))), trace = 0)
+
+orig_r2 = summary(td_mod)$adj.r.squared
+fwd_aic_r2 = summary(td_mod_forw_aic)$adj.r.squared
+fwd_bic_r2 = summary(td_mod_forw_bic)$adj.r.squared
+orig_lr = calc_loocv_rmse(td_mod)
+fwd_aic_lr = calc_loocv_rmse(td_mod_forw_aic)
+fwd_bic_lr = calc_loocv_rmse(td_mod_forw_bic)
+
+knitr::kable(data.frame(
+  Model = c("Original", "Backward AIC", "Backward BIC", "Forward AIC", "Forward BIC"),
+  R.Sq = c(orig_r2, bck_aic_r2, bck_bic_r2, fwd_aic_r2, fwd_bic_r2),
+  L.R = c(orig_lr, bck_aic_lr, bck_bic_lr, fwd_aic_lr, fwd_bic_lr))
+)
+```
+
+As another starting point for more exploration, we consider a model developed with a broad cross-section of second order interactions. We then subject this model to the same forward and bacward AIC and BIC model selection processes.
+
+```{r}
+td_big_mod = lm(
+    total_deaths ~ . + 
+    handwashing_facilities:life_expectancy +
+    cvd_death_rate:diabetes_prevalence +
+    I(cvd_death_rate ^ 2) +
+    I(stringency_index ^ 2) +
+    I(population ^ 2) + 
+    I(median_age ^ 2) + 
+    I(aged_70_older ^ 2) + 
+    I(gdp_per_capita ^ 2) + 
+    I(male_smokers ^ 2) + 
+    I(handwashing_facilities ^ 2) + 
+    I(stringency_index ^ 2) + 
+    I(diabetes_prevalence ^ 2) + 
+    I(male_smokers ^ 2) + 
+    I(hospital_beds_per_thousand ^ 2) +
+    I(life_expectancy ^ 2),
+  data = data
+)
+
+n = length(resid(td_big_mod))
+
+td_big_mod_back_aic = step(td_big_mod, direction="backward", trace = 0)
+td_big_mod_back_bic = step(td_big_mod, direction="backward", k = log(n), trace = 0)
+
+td_mod_start = lm(total_deaths ~ 1, data = data)
+td_big_mod_forw_aic = step(
+  td_mod_start,
+  scope = total_deaths ~ . + 
+    handwashing_facilities:life_expectancy +
+    cvd_death_rate:diabetes_prevalence +
+    I(cvd_death_rate ^ 2) +
+    I(stringency_index ^ 2) +
+    I(population ^ 2) + 
+    I(median_age ^ 2) + 
+    I(aged_70_older ^ 2) + 
+    I(gdp_per_capita ^ 2) + 
+    I(male_smokers ^ 2) + 
+    I(handwashing_facilities ^ 2) + 
+    I(stringency_index ^ 2) + 
+    I(diabetes_prevalence ^ 2) + 
+    I(male_smokers ^ 2) + 
+    I(hospital_beds_per_thousand ^ 2) +
+    I(life_expectancy ^ 2),
+  direction = "forward", trace = 0)
+
+td_big_mod_forw_bic = step(
+  td_mod_start,
+  scope = total_deaths ~ . + 
+    handwashing_facilities:life_expectancy +
+    cvd_death_rate:diabetes_prevalence +
+    I(cvd_death_rate ^ 2) +
+    I(stringency_index ^ 2) +
+    I(population ^ 2) + 
+    I(median_age ^ 2) + 
+    I(aged_70_older ^ 2) + 
+    I(gdp_per_capita ^ 2) + 
+    I(male_smokers ^ 2) + 
+    I(handwashing_facilities ^ 2) + 
+    I(stringency_index ^ 2) + 
+    I(diabetes_prevalence ^ 2) + 
+    I(male_smokers ^ 2) + 
+    I(hospital_beds_per_thousand ^ 2) +
+    I(life_expectancy ^ 2),
+  direction = "forward", k = log(n), trace = 0)
+
+big_r2 = summary(td_big_mod)$adj.r.squared
+fwra_r2 = summary(td_big_mod_forw_aic)$adj.r.squared
+fwrb_r2 = summary(td_big_mod_forw_bic)$adj.r.squared
+big_lr = calc_loocv_rmse(td_big_mod)
+fwra_lr = calc_loocv_rmse(td_big_mod_forw_aic)
+fwrb_lr = calc_loocv_rmse(td_big_mod_forw_bic)
+big_r2 = summary(td_big_mod)$adj.r.squared
+bcka_r2 = summary(td_big_mod_back_aic)$adj.r.squared
+bckb_r2 = summary(td_mod_back_bic)$adj.r.squared
+big_lr = calc_loocv_rmse(td_big_mod)
+bcka_lr = calc_loocv_rmse(td_big_mod_back_aic)
+bckb_lr = calc_loocv_rmse(td_mod_back_bic)
+
+knitr::kable(
+  data.frame(Model = c("Big Model", "Backard AIC", "Backard BIC", "Forward AIC", "Forward BIC"),
+             R.Sq = c(big_r2, bcka_r2, bckb_r2, fwra_r2, fwrb_r2),
+             L.R = c(big_lr, bcka_lr, bckb_lr, fwra_lr, fwrb_lr))
+  )
+```
+
+This time around, the backward AIC model returns an $R^2$ value that is a marked improvement over the baseline additive model and its backward AIC/BIC counterparts. However, the initial "big" interaction model has a similar enough $R^2$ value that we should evaluate which model to prefer using the Analysis of Variations:
+
+```{r}
+anova(td_big_mod, td_big_mod_back_aic)
+```
+
+This incredibly high $p$-value suggests that we should fail to reject the null hypothesis that the first (big interaction) model is preferred over its backward AIC counterpart. In comparing this to the baseline additive model using an Analysis of Variations, we find that in light of its improved fitness, the big interactive model's high dimensionality causes us to reject the null hypothesis that it contains more useful information than the baseline additive model. So, we're back where we started.
+
+```{r}
+anova(td_big_mod, td_mod)
+```
+
+## *Results*
+Through this extensive and circuitous path through a range of model options and assumption validations, we arrived at a simple additive model providing the best and most explainable relationship between the socio-economic and environmental predictor variables and the COVID death rate response variable.
+
+A summary of the selected model is provided here:
+```{r}
+summary(td_mod)
+```
+
+We find in this model some relatively moderate $R^2$ and adjusted-$R^2$ values, but an acceptable $p$-value for an F-test which asks if the relationship between the model predictor variables and the response variable (death rate) is statistically significant for most reasonable alpha values (including $\alpha = 0.01$). This allows us to conclude to a very high degree of confidence that the relationships between these variables are meaningful and not spurious.
+
+## *Discussion*
+
+"All models are wrong, but some are useful"
+
+*- George Box, and our internal model on the efficacy of models*
+
+As we have seen through the analysis in these many pages, there are clearly some underlying relationships between the environmental, geographical, and socio-economic factors in countries across the world and their populations' propensities to contract the novel COVID-19 coronavirus. What is more, the complexity of this problem and the myriad ways to describe, encode, and draw inference from the available quantitative data leave us in a position to have profoundly refined and nuancced tools at our fingertips that, unfortunately, offer the potential to produce increasingly arbitrary conclusions. We require a religious adherence to model- and assumption-validation procedures in order to keep us from deluding ourselves into a false belief that we have stumbled upon perfect descriptors of the complex world based on imperfect analysis.
+
+However, this pessimism is not meant to detract from the very real conclusion that this analysis produces meaningful results. After all, some models *are* useful. The methods, processes, and procedures by which we analyzed this COVID data clearly demonstrate a few useful lessons. First, any sources offering obtusely complicated justifications for the spread and contraction of COVID may be technically valid, though no more useful than a simpler, easier-to-explain justification that can more readily be accepted by the average listener. Similarly, sources offering to over-simplify the root cause of contributors to the problem should be rejected outright: they lack the sophistication and nuance required to render the public adequately informed from a scientific standpoint.
+
+This disease is inexplicably hard to understand - with changing directions from higher authorities on a weekly basis, various populations shouldering the burden in a non-equitable manner, and new concerns brought to our attention on a daily basis. Our analysis has closed some of that margin of uncertainty by isolating several factors across different models to highlight their relevance. While that margin has shrunk, we are not wholly confident. We can only hope that these models provide some direction to lean forward to better understanding. In the spirit of the George Box quote, our models are certainly not robust and should not be taken as explicit explanations. And yet, they do provide further insight into the virus and which factors could potentially be used to better understand it.
+
+Going further a step further, it is important to maintain a firm grasp of the context: this virus is still in its infancy. The flu has been around for a millennia and vaccines - virtually a modern day invention (relatively speaking) - are changing regularly to combat it. With the limited information we have today, there is only so much we can hope to extract. All in all, however, our models do provide some degree of actionable insight to further combat this virus and provide further commentary on the matter to the average individual.
+
+## *Appendix*
+
+### Diabetes Prevalence
+
+#### Simple Regression Model
+```{r fig.align="center"}
+covid_simple = lm(diabetes_prevalence ~ total_cases_by_population, data = covid)
+
+colors = c("red", "blue")
+plot(diabetes_prevalence ~ total_cases_by_population, data = covid, col = colors[continent], main = "Population with Diabetes vs Population with COVID-19", xlab = "Percentage of Population with COVID-19", ylab = "Percentage of Population with Diabetes")
+abline(covid_simple, lwd = 3)
+legend("topleft", c("Africa", "Asia"), col = colors, pch = c(1, 2))
+
+coef = summary(covid_simple)$coef[, 1]
+africa = coef[1]
+asia = coef[1]
+africa_slope_simple = coef[2]
+asia_slope_simple = coef[2]
+```
+
+#### Additive Multiple Regression Model
+```{r fig.align="center"}
+covid_add = lm(diabetes_prevalence ~ total_cases_by_population + continent, data = covid)
+
+colors = c("red", "blue")
+plot(diabetes_prevalence ~ total_cases_by_population, data = covid, col = colors[continent], main = "Population with Diabetes vs Population with COVID-19", xlab = "Percentage of Population with COVID-19", ylab = "Percentage of Population with Diabetes")
+legend("topleft", c("Africa", "Asia"), col = colors, pch = c(1, 2))
+
+coef_add = summary(covid_add)$coef[, 1]
+africa_add = coef_add[1] + coef_add[3]
+asia_add = coef_add[1] + coef_add[4]
+slope_add = coef_add[2]
+
+abline(africa_add, slope_add, lwd = 2, col = colors[1])
+abline(asia_add, slope_add, lwd = 2, col = colors[2])
+```
+
+#### Interaction Multiple Regression Model
+```{r fig.align="center"}
+covid_int = lm(diabetes_prevalence ~ total_cases_by_population * continent, data = covid)
+
+colors = c("red", "blue")
+plot(diabetes_prevalence ~ total_cases_by_population, data = covid, col = colors[continent], main = "Population with Diabetes vs Population with COVID-19", xlab = "Percentage of Population with COVID-19", ylab = "Percentage of Population with Diabetes", pch = as.numeric(continent))
+legend("topleft", c("Africa", "Asia"), col = colors, pch = c(1, 2))
+
+coef_int = summary(covid_int)$coef[, 1]
+africa_int = coef_int[1] + coef_int[3]
+asia_int = coef_int[1] + coef_int[4]
+
+africa_slope_int = coef_int[2] + coef_int[9]
+asia_slope_int = coef_int[2] + coef_int[10]
+
+abline(africa_int, africa_slope_int, lwd = 2, col = colors[1])
+abline(asia_int, asia_slope_int, lwd = 2, col = colors[2])
+```
+
+```{r}
+anova(covid_add, covid_int)
+```
+
+### Aging Population
+
+#### Additive Multiple Regression Model
+```{r fig.align="center"}
+covid_add = lm(aged_65_older ~ total_cases_by_population + continent, data = covid)
+
+colors = c("red", "blue")
+plot(aged_65_older ~ total_cases_by_population, data = covid, col = colors[continent], main = "Aging Population vs Population with COVID-19", xlab = "Percentage of Population with COVID-19", ylab = "Percentage of Aging Population")
+legend("topleft", c("Africa", "Asia"), col = colors, pch = c(1, 2))
+
+coef_add = summary(covid_add)$coef[, 1]
+africa_add = coef_add[1] + coef_add[3]
+asia_add = coef_add[1] + coef_add[4]
+slope_add = coef_add[2]
+
+abline(africa_add, slope_add, lwd = 2, col = colors[1])
+abline(asia_add, slope_add, lwd = 2, col = colors[2])
+```
+
+#### Interaction Multiple Regression Model
+```{r fig.align="center"}
+covid_int = lm(aged_65_older ~ total_cases_by_population * continent, data = covid)
+
+colors = c("red", "blue")
+plot(aged_65_older ~ total_cases_by_population, data = covid, col = colors[continent], main = "Aging Population vs Population with COVID-19", xlab = "Percentage of Population with COVID-19", ylab = "Percentage of Aging Population", pch = as.numeric(continent))
+legend("topleft", c("Africa", "Asia"), col = colors, pch = c(1, 2))
+
+coef_int = summary(covid_int)$coef[, 1]
+africa_int = coef_int[1] + coef_int[3]
+asia_int = coef_int[1] + coef_int[4]
+
+africa_slope_int = coef_int[2] + coef_int[9]
+asia_slope_int = coef_int[2] + coef_int[10]
+
+abline(africa_int, africa_slope_int, lwd = 2, col = colors[1])
+abline(asia_int, asia_slope_int, lwd = 2, col = colors[2])
+```
+
+```{r}
+anova(covid_add, covid_int)
+```
+
+### Cardiovascular Death Rate
+
+#### Additive Multiple Regression Model
+```{r fig.align="center"}
+covid_add = lm(cvd_death_rate ~ total_cases_by_population + continent, data = covid)
+
+colors = c("red", "blue")
+plot(cvd_death_rate ~ total_cases_by_population, data = covid, col = colors[continent], main = "Number of Deaths from Cardiovascular Disease vs Population with COVID-19", xlab = "Percentage of Population with COVID-19", ylab = "Percentage of Deaths from Cardiovascular Disease")
+legend("topleft", c("Africa", "Asia"), col = colors, pch = c(1, 2))
+
+coef_add = summary(covid_add)$coef[, 1]
+africa_add = coef_add[1] + coef_add[3]
+asia_add = coef_add[1] + coef_add[4]
+slope_add = coef_add[2]
+
+abline(africa_add, slope_add, lwd = 2, col = colors[1])
+abline(asia_add, slope_add, lwd = 2, col = colors[2])
+```
+
+#### Interaction Multiple Regression Model
+```{r fig.align="center"}
+covid_int = lm(cvd_death_rate ~ total_cases_by_population * continent, data = covid)
+
+colors = c("red", "blue")
+plot(cvd_death_rate ~ total_cases_by_population, data = covid, col = colors[continent], main = "Number of Deaths from Cardiovascular Disease vs Population with COVID-19", xlab = "Percentage of Population with COVID-19", ylab = "Percentage of Deaths from Cardiovascular Disease", pch = as.numeric(continent))
+legend("topleft", c("Africa", "Asia"), col = colors, pch = c(1, 2))
+
+coef_int = summary(covid_int)$coef[, 1]
+africa_int = coef_int[1] + coef_int[3]
+asia_int = coef_int[1] + coef_int[4]
+
+africa_slope_int = coef_int[2] + coef_int[9]
+asia_slope_int = coef_int[2] + coef_int[10]
+
+abline(africa_int, africa_slope_int, lwd = 2, col = colors[1])
+abline(asia_int, asia_slope_int, lwd = 2, col = colors[2])
+```
+
+```{r}
+anova(covid_add, covid_int)
+```
